@@ -1,0 +1,27 @@
+{
+    "features": {
+        "trial_level": ["world", "turn", "correct", "prev_correct", "prev_world"],
+        "continuous": ["pitch", "roll", "yaw", "dpitch", "droll", "dyaw"]
+    },
+    "basis_expansions": {
+        "spatial_cosine": {"n_basis_funcs": 20, "type": "RaisedCosineLinearEval"},
+        "temporal_cosine": {"n_basis_funcs": 15, "type": "RaisedCosineLinearEval"},
+        "bspline": {"n_basis_funcs": 7, "order": 4, "type": "BSplineEval"}
+    },
+    "feature_basis_mapping": {
+        "trial_level": {"trial": "spatial_cosine", "iti": "temporal_cosine"},
+        "continuous": "bspline"
+    },
+    "binning": {
+        "n_spatial_bins": 100,
+        "n_temporal_bins": 50
+    },
+    "model": {
+        "observation_model": "Gamma",
+        "regularizer": "GroupLasso",
+        "regularizer_strength": 0.01,
+        "solver_name": "ProximalGradient",
+        "solver_kwargs": {"maxiter": 500}
+    },
+    "target_layer": "dcnv_norm"
+}
