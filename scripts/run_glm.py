@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-run_glm.py — Fit a Gamma GLM to neural calcium imaging data.
+run_glm.py — Fit a Poisson GLM to neural calcium imaging data.
 
 Generalised from the prototype notebook (glm_prototype.ipynb).
 Reads a run-specification JSON to configure features, basis expansions,
@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import shutil
-from pathlib import Path
 
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -25,6 +24,8 @@ import jax.numpy as jnp
 import nemos as nmo
 import numpy as np
 import pandas as pd
+
+from preprocess import bin_adata_vectorized
 
 logger = logging.getLogger(__name__)
 
@@ -73,127 +74,8 @@ def load_data(mouse: str, session: str, output_dir: str, data_path: str | None =
 
 
 # ---------------------------------------------------------------------------
-# 2. Bin data
+# 2. Bin data (delegates to preprocess.bin_adata_vectorized)
 # ---------------------------------------------------------------------------
-def bin_data(
-    adata: ad.AnnData,
-    n_spatial_bins: int = 100,
-    n_temporal_bins: int = 50,
-) -> ad.AnnData:
-    """Spatially bin trial periods and temporally bin ITI periods."""
-
-    y_min = adata.obs.loc[~adata.obs["inITI"], "y"].min()
-    y_max = adata.obs.loc[~adata.obs["inITI"], "y"].max()
-    spatial_edges = np.linspace(y_min, y_max, n_spatial_bins + 1)
-
-    # Determine which obs columns are trial-level vs continuous
-    trial_level_candidates = [
-        "world", "turn", "rewarded_side", "correct", "prev_correct",
-        "prev_world", "trial", "accuracy", "target_x", "trial_len_s",
-        "rewarded_trial", "trial_type", "wall_color", "ITI_correct",
-        "trial_type_ITI",
-    ]
-    continuous_candidates = [
-        "pitch", "roll", "yaw", "x", "y", "h", "dx", "dy", "dh", "dt", "t",
-        "sync_reward", "reward", "lick", "target_y", "target_dist",
-        "dtarget_dist", "ddtarget_dist", "h_target", "h_error",
-        "abs_h_error", "dh_error", "ddh_error", "ddh", "abs_ddh",
-    ]
-    trial_level_vars = [v for v in trial_level_candidates if v in adata.obs.columns]
-    continuous_vars = [v for v in continuous_candidates if v in adata.obs.columns]
-
-    binned_rows: list[dict] = []
-    trial_ids = sorted(adata.obs["trial"].unique())
-    logger.info("Binning %d trials …", len(trial_ids))
-
-    for trial_id in trial_ids:
-        trial_mask = adata.obs["trial"] == trial_id
-        trial_adata = adata[trial_mask]
-
-        # --- Trial portion: spatial binning ---
-        not_iti = ~trial_adata.obs["inITI"].values
-        if not_iti.sum() > 0:
-            trial_y = trial_adata.obs.loc[not_iti, "y"].values
-            bin_idx = np.clip(
-                np.digitize(trial_y, spatial_edges) - 1, 0, n_spatial_bins - 1
-            )
-            for b in range(n_spatial_bins):
-                bmask = bin_idx == b
-                if bmask.sum() == 0:
-                    continue
-                row: dict = {}
-                row["neural"] = np.asarray(
-                    trial_adata[not_iti][bmask].X.mean(axis=0)
-                ).flatten()
-                for layer_name in trial_adata.layers:
-                    row[f"layer_{layer_name}"] = np.asarray(
-                        trial_adata[not_iti][bmask].layers[layer_name].mean(axis=0)
-                    ).flatten()
-                for var in continuous_vars:
-                    vals = trial_adata.obs.loc[not_iti, var].values[bmask]
-                    row[var] = np.nanmean(vals.astype(float))
-                for var in trial_level_vars:
-                    row[var] = trial_adata.obs.loc[not_iti, var].values[0]
-                row["spatial_bin"] = b
-                row["is_iti"] = False
-                row["trial_id"] = trial_id
-                binned_rows.append(row)
-
-        # --- ITI portion: temporal binning ---
-        iti = trial_adata.obs["inITI"].values
-        if iti.sum() > 0:
-            n_iti_frames = int(iti.sum())
-            bin_edges_iti = np.linspace(
-                0, n_iti_frames, n_temporal_bins + 1
-            ).astype(int)
-            for b in range(n_temporal_bins):
-                start, end = bin_edges_iti[b], bin_edges_iti[b + 1]
-                if end <= start:
-                    continue
-                idx_slice = np.arange(start, end)
-                row = {}
-                row["neural"] = np.asarray(
-                    trial_adata[iti][idx_slice].X.mean(axis=0)
-                ).flatten()
-                for layer_name in trial_adata.layers:
-                    row[f"layer_{layer_name}"] = np.asarray(
-                        trial_adata[iti][idx_slice]
-                        .layers[layer_name]
-                        .mean(axis=0)
-                    ).flatten()
-                for var in continuous_vars:
-                    vals = trial_adata.obs.loc[iti, var].values[idx_slice]
-                    row[var] = np.nanmean(vals.astype(float))
-                for var in trial_level_vars:
-                    row[var] = trial_adata.obs.loc[iti, var].values[0]
-                row["spatial_bin"] = b
-                row["is_iti"] = True
-                row["trial_id"] = trial_id
-                binned_rows.append(row)
-
-    # Reconstruct anndata
-    neural_mat = np.vstack([r["neural"] for r in binned_rows])
-    scalar_keys = [
-        k for k in binned_rows[0]
-        if k != "neural" and not k.startswith("layer_")
-    ]
-    obs_df = pd.DataFrame({k: [r.get(k, np.nan) for r in binned_rows] for k in scalar_keys})
-    layers_dict = {}
-    layer_names = [
-        k.replace("layer_", "") for k in binned_rows[0] if k.startswith("layer_")
-    ]
-    for ln in layer_names:
-        layers_dict[ln] = np.vstack([r[f"layer_{ln}"] for r in binned_rows])
-
-    adata_binned = ad.AnnData(
-        X=neural_mat,
-        obs=obs_df,
-        var=adata.var.copy(),
-        layers=layers_dict,
-        uns=adata.uns.copy(),
-    )
-    logger.info("Binned adata shape: %s", adata_binned.shape)
-    return adata_binned
 
 
 # ---------------------------------------------------------------------------
@@ -475,10 +357,10 @@ def _save_all(
         logger.info("Saved group_mask.npy  %s", group_mask.shape)
 
     # Pseudo-R²
-    r2 = float(model.score(X, Y, score_type="pseudo-r2-McFadden"))
-    logger.info("Pseudo-R² (McFadden): %.6f", r2)
+    r2 = float(model.score(X, Y, score_type="pseudo-r2-Cohen"))
+    logger.info("Pseudo-R² (Cohen, deviance explained): %.6f", r2)
     with open(os.path.join(output_dir, "score.json"), "w") as f:
-        json.dump({"pseudo_r2_mcfadden": r2}, f, indent=2)
+        json.dump({"pseudo_r2_cohen": r2}, f, indent=2)
 
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
@@ -496,7 +378,7 @@ def _save_all(
         f"  n_neurons         : {Y.shape[1]}",
         f"  n_groups          : {len(group_info)}",
         f"  groups            : {group_names}",
-        f"  pseudo_r2         : {r2:.6f}",
+        f"  pseudo_r2_cohen   : {r2:.6f}",
         f"  coef_ shape       : {W.shape}",
     ]
     with open(os.path.join(output_dir, "summary.txt"), "w") as f:
@@ -510,7 +392,7 @@ def _save_all(
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit a Gamma GLM to neural calcium imaging data."
+        description="Fit a Poisson GLM to neural calcium imaging data."
     )
     parser.add_argument("--mouse", required=True, help="Mouse ID (e.g. YRA084)")
     parser.add_argument("--session", required=True, help="Session ID (e.g. 260228)")
@@ -544,7 +426,7 @@ def main():
 
     # 2. Bin
     binning = config.get("binning", {})
-    adata_binned = bin_data(
+    adata_binned = bin_adata_vectorized(
         adata,
         n_spatial_bins=binning.get("n_spatial_bins", 100),
         n_temporal_bins=binning.get("n_temporal_bins", 50),
@@ -556,7 +438,7 @@ def main():
     # 4. Target
     target_layer = config.get("target_layer", "dcnv_norm")
     Y = np.array(adata_binned.layers[target_layer], dtype=np.float64)
-    Y = Y + 1e-6  # offset for Gamma
+    Y = Y + 1e-6  # small offset for numerical stability
     logger.info("Y shape: %s  range: %.6f – %.4f", Y.shape, Y.min(), Y.max())
 
     # 5. Fit

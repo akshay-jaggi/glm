@@ -17,7 +17,7 @@
         "n_temporal_bins": 25
     },
     "model": {
-        "observation_model": "Gamma",
+        "observation_model": "Poisson",
         "regularizer": "GroupLasso",
         "regularizer_strength": 0.01,
         "solver_name": "ProximalGradient",
